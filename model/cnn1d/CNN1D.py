@@ -1,55 +1,20 @@
 import copy
 
 import pandas as pd
+import pandas.core.frame
 
-from data.dataset import Dataset
 from model.abstractmodel import AbstractModel
 import torch.cuda
-from torch.utils.data import DataLoader
-from torch.utils.data import Dataset as TorchDataset
+from torch.utils.data import TensorDataset, DataLoader
 from torch.optim import Adam
 from tqdm import tqdm
 import numpy as np
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import root_mean_squared_error
 
 
 class CNN1D(AbstractModel):
-    """
-    Inspired by the second place solution of the Mechanisms of Action (MoA) Prediction Challange
-    https://www.kaggle.com/c/lish-moa/discussion/202256,
-    we develop a model that based on 1D convolutional layers. The dimensions of the input features are initially
-    expanded to $2^{12}$ using a fully connected layer, followed by reshaping into segmented sequences. This procedure
-    enables the model to have sufficient capacity to execute subsequential operations and learn patterns. Subsequently,
-    four convolutional components are concatenated. A pooling operation is performed between the first two convolutional
-    layers to decrease the dimensions of the hidden layer by consolidating the outputs of neuron clusters in the
-    previous layer into a single neuron in the subsequent layer. The output of the second convolutional component is
-    connected to the last convolutional layer through production as a shortcut mechanism.
-
-    In each convolutional component, the signal sequences are first batch normalized to enhance the training process's
-    efficiency and stability by re-centring and re-scaling. The subsequential dropout layer helps avoid overfitting by
-    scaling inputs not set to 0 up by $1/(1 - \text{rate})$ such that the sum over all inputs remains constant. A
-    Rectified Linear Unit (ReLU) layer is chosen as the activation function. Similar to the 2D convolution, the key
-    operation of the component, the computation of a neuron in a 1D convolution operation, can also be described as
-
-    $$
-    \hat{y}_{i,k} = B_k + \sum_{u=0}^{f_d-1} { \sum_{k'=0}^{f_{n'}-1} { x_{i',k'} \cdot w_{u,k',k} } } \ \text{with} \ i' = i \times s_d + u
-    $$
-
-    where
-
-    - $\hat{y}_{i,k}$ is the output of the neuron in position $i$ and feature map $k$ in the convolutional layer $l$
-    - $x_{i',k'}$ is the output of the neuron in position $i'$ and the convolutional layer $l-1$
-    - $B_k$ is the bias term for feature map $k$ in the convolutional layer $l$
-    - $s_d$ is the strides
-    - $f_d$ is the length of the strides
-    - $f_{n'}$ is the number of feature maps in the convolutional layer $l-1$
-    - $\cdot w_{u,k',k}$ is the connection weight between any neuron in feature map $k$ of the convolutional layer $l$
-      and its input located at position $u$ and feature map $k'$
-    """
-
     def __init__(
             self,
-            task_type: str,
             n_tasks: int,
             in_feats: int,
             lr: float = 0.001,
@@ -57,62 +22,49 @@ class CNN1D(AbstractModel):
             device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"),
             **kwargs
     ):
-        """
-        :param task_type: Regression or Classification
-        :param n_tasks: Number of tasks.
-        :param in_feats: Number of input features.
-        :param lr: Learning rate.
-        :param weight_decay: Weight Decay
-        :param device: torch.device
-        :param kwargs: Other parameters
-        """
-        super().__init__(task_type=task_type, description_info="1D Tabular Data")
         self.best_state_dict = None
         self.model_config = kwargs
         self.in_feats = in_feats
         self.out_feats = n_tasks
         self.device = device
-        self.model = _TabCnn1d(
-            in_feats=self.in_feats,
-            out_feats=self.out_feats,
-            **kwargs
-        ).to(self.device)
+        super().__init__(
+            model=_TabCnn1d(
+                in_feats=self.in_feats,
+                out_feats=self.out_feats,
+                **kwargs
+            ).to(self.device))
         self.optim = Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
         self.loss_f = torch.nn.SmoothL1Loss()
 
     def fit(
             self,
-            trn: Dataset,
-            max_epochs: int,
-            *args,
+            trn_X,
+            trn_y,
+            val_X=None,
+            val_y=None,
+            max_epochs: int = 100,
             min_epochs: int = 0,
             early_stop: int = 0,
-            val: Dataset = None,
             batch_size: int = 128,
             verbose: bool = True,
             **kwargs
     ):
-        """
-        :param trn: Training set.
-        :param max_epochs: Maximum number of epochs.
-        :param min_epochs: Minimum number of epochs.
-        :param early_stop: Early stopping patience.
-        :param val: Validation set.
-        :param batch_size: Batch size.
-        :param verbose: Verbose
-        :param kwargs: other parameters.
-        :return: Validation scores in each epoch.
-        """
         scores = {"loss": [], "val_loss": [], "val_rmse": []}
         stop_counter = early_stop
         best_rmse = float("inf")
 
         trn_dl = DataLoader(
-            dataset=_Dataset(trn),
+            dataset=TensorDataset(
+                torch.tensor(trn_X.values).float(),
+                torch.tensor(trn_y.values).float().reshape(-1, 1)
+            ),
             batch_size=batch_size
         )
-        val_dl = None if val is None else DataLoader(
-            dataset=_Dataset(val),
+        val_dl = None if val_X is None or val_y is None else DataLoader(
+            dataset=TensorDataset(
+                torch.tensor(val_X.values).float(),
+                torch.tensor(val_y.values).float().reshape(-1, 1)
+            ),
             batch_size=batch_size
         )
 
@@ -121,12 +73,12 @@ class CNN1D(AbstractModel):
             loss = self._train_epoch(trn_dl)
             scores["loss"].append(loss)
 
-            if val is None:
+            if val_X is None or val_y is None:
                 if bar is not None:
                     bar.set_postfix_str(f"loss: {loss:.3f}")
             else:
                 val_loss, pred = self._validate_epoch(val_dl)
-                val_rmse = mean_squared_error(val.y, pd.DataFrame(pred).fillna(0), squared=False)
+                val_rmse = root_mean_squared_error(val_y, pd.DataFrame(pred).fillna(0))
                 scores["val_loss"].append(val_loss)
                 scores["val_rmse"].append(val_rmse)
                 if val_rmse <= best_rmse:
@@ -193,34 +145,23 @@ class CNN1D(AbstractModel):
         pred = []
 
         for data in dataloader:
-            X, _ = data
+            X = data[0]
             X = X.to(self.device)
             with torch.no_grad():
-                pred.append(model(X).detach().cpu().numpy())
+                pred.append(model(X).detach().cpu())
+                # pred.append(model(X).detach().cpu().numpy())
 
         return np.concatenate(pred)
 
-    def predict(self, dataset: Dataset, batch_size: int = 128, use_best_state: bool = False):
+    def predict(self, X, batch_size: int = 128, use_best_state: bool = False):
+        X = X.values if type(X) is pandas.core.frame.DataFrame else X
         dl = DataLoader(
-            dataset=_Dataset(dataset),
+            dataset=TensorDataset(
+                torch.tensor(X).float(),
+            ),
             batch_size=batch_size
         )
         return self._predict_epoch(dl, use_best_state)
-
-    def cross_validate(self, dataset: Dataset, epochs: int, *args, **kwargs):
-        pass
-
-
-class _Dataset(TorchDataset):
-    def __init__(self, dataset: Dataset):
-        self.X = torch.tensor(dataset.X.values, dtype=torch.float)
-        self.y = None if dataset.y is None else torch.tensor(dataset.y.values, dtype=torch.float)
-
-    def __len__(self):
-        return self.X.shape[0]
-
-    def __getitem__(self, index):
-        return self.X[index], None if self.y is None else self.y[index]
 
 
 class _TabCnn1d(torch.nn.Module):
@@ -268,7 +209,7 @@ class _TabCnn1d(torch.nn.Module):
 
         from torch.nn import (Sequential, BatchNorm1d, Dropout, Linear, CELU, Conv1d,
                               AdaptiveAvgPool1d, ReLU, MaxPool1d, Flatten)
-        from torch.nn.utils import weight_norm
+        from torch.nn.utils.parametrizations import weight_norm
 
         self.dense = Sequential(
             BatchNorm1d(in_feats),

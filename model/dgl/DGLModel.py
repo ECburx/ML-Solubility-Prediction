@@ -27,7 +27,7 @@ class DGLModel(AbstractModel):
             weight_decay: float = 0,
             batch_size: int = 128,
     ):
-        print(f"[DEVICE] {device}")
+        # print(f"[DEVICE] {device}")
         self.device = device
         self.batch_size = batch_size
         self.loss = loss
